@@ -171,7 +171,155 @@ class Story:
             raise RuntimeError(err)
 
     def __del__(self):
-        LIB.bink_story_free(self._story)
+        if hasattr(self, '_story'):
+            LIB.bink_story_free(self._story)
+
+    # --- Variable access ---
+
+    def get_variable(self, name: str):
+        """Get the current value of an Ink variable by name.
+
+        Returns a Python value: str, int, float, or bool.
+        """
+        value = ctypes.c_void_p()
+        ret = LIB.bink_var_get(
+            self._story, name.encode('utf-8'), ctypes.byref(value))
+        if ret != BINK_OK:
+            raise RuntimeError(f"Error getting variable '{name}'")
+        result = _value_to_python(value)
+        LIB.bink_value_free(value)
+        return result
+
+    def set_variable(self, name: str, value):
+        """Set an Ink variable to a new value."""
+        ink_value = _python_to_value(value)
+        ret = LIB.bink_var_set(
+            self._story, name.encode('utf-8'), ink_value)
+        if ret != BINK_OK:
+            raise RuntimeError(f"Error setting variable '{name}'")
+
+    # --- External functions ---
+
+    def bind_external_function(self, func_name: str, fn):
+        """Bind a Python callable as an Ink EXTERNAL function.
+
+        The callable receives arguments as Python values (str/int/float/bool)
+        and should return a Python value, or None for void functions.
+        """
+        from bink import EXTERNAL_FUNCTION_CB
+
+        # Create a ctypes callback that wraps the Python function
+        @EXTERNAL_FUNCTION_CB
+        def _callback(fun_args, userdata):
+            # Read arguments from the fun_args context
+            argc = LIB.bink_fun_args_count(fun_args)
+            args = []
+            for i in range(argc):
+                arg_val = ctypes.c_void_p()
+                ret = LIB.bink_fun_args_get(
+                    fun_args, i, ctypes.byref(arg_val))
+                if ret == BINK_OK:
+                    args.append(_value_to_python(arg_val))
+                    LIB.bink_value_free(arg_val)
+
+            # Call the Python function
+            result = fn(*args)
+
+            # Convert return value
+            if result is None:
+                return ctypes.c_void_p(0).value or 0
+            return _python_to_value(result) or 0
+
+        # Store reference to prevent GC
+        if not hasattr(self, '_external_callbacks'):
+            self._external_callbacks = {}
+        self._external_callbacks[func_name] = _callback
+
+        ret = LIB.bink_bind_external_function(
+            self._story,
+            func_name.encode('utf-8'),
+            _callback,
+            ctypes.c_void_p(0))
+        if ret != BINK_OK:
+            raise RuntimeError(f"Error binding external function '{func_name}'")
+
+    def unbind_external_function(self, func_name: str):
+        """Remove a previously bound external function."""
+        ret = LIB.bink_unbind_external_function(
+            self._story, func_name.encode('utf-8'))
+        if ret != BINK_OK:
+            raise RuntimeError(f"Error unbinding external function '{func_name}'")
+        if hasattr(self, '_external_callbacks'):
+            self._external_callbacks.pop(func_name, None)
+
+    # --- Variable observers ---
+
+    def observe_variable(self, var_name: str, callback):
+        """Register a callback to be called when an Ink variable changes.
+
+        The callback receives (var_name: str, new_value).
+        """
+        from bink import VARIABLE_OBSERVER_CB
+
+        @VARIABLE_OBSERVER_CB
+        def _observer(c_name, new_value, userdata):
+            name_str = c_name.decode('utf-8') if c_name else var_name
+            val = _value_to_python(new_value) if new_value else None
+            callback(name_str, val)
+
+        if not hasattr(self, '_variable_observers'):
+            self._variable_observers = {}
+        self._variable_observers[var_name] = _observer
+
+        ret = LIB.bink_observe_variable(
+            self._story,
+            var_name.encode('utf-8'),
+            _observer,
+            ctypes.c_void_p(0))
+        if ret != BINK_OK:
+            raise RuntimeError(f"Error observing variable '{var_name}'")
+
+
+def _value_to_python(value) -> object:
+    """Convert a bink_value pointer to a Python value.
+
+    Tries string, int, float, bool in order and returns the first
+    successful one. Returns None if no conversion works.
+    """
+    # Try string first (most common Ink type)
+    s = ctypes.c_char_p()
+    if LIB.bink_value_get_string(value, ctypes.byref(s)) == BINK_OK and s.value is not None:
+        return s.value.decode('utf-8')
+
+    # Try int
+    i = ctypes.c_int64()
+    if LIB.bink_value_get_int(value, ctypes.byref(i)) == BINK_OK:
+        return i.value
+
+    # Try float
+    f = ctypes.c_double()
+    if LIB.bink_value_get_float(value, ctypes.byref(f)) == BINK_OK:
+        return f.value
+
+    # Try bool
+    b = ctypes.c_bool()
+    if LIB.bink_value_get_bool(value, ctypes.byref(b)) == BINK_OK:
+        return b.value
+
+    return None
+
+
+def _python_to_value(value) -> ctypes.c_void_p:
+    """Convert a Python value to a bink_value pointer."""
+    if isinstance(value, bool):
+        return LIB.bink_value_new_bool(value)
+    if isinstance(value, int):
+        return LIB.bink_value_new_int(value)
+    if isinstance(value, float):
+        return LIB.bink_value_new_float(value)
+    if isinstance(value, str):
+        return LIB.bink_value_new_string(value.encode('utf-8'))
+    raise TypeError(f"Cannot convert {type(value)} to bink value")
 
 
 def story_from_file(story_file: str):
