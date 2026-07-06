@@ -2,9 +2,23 @@
 
 """Handle Ink Story."""
 import ctypes
+import inspect
 from bink.choices import Choices
 from bink.tags import Tags
 from bink import LIB, BINK_OK
+
+
+def _external_reads_args(fn):
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    for parameter in signature.parameters.values():
+        if parameter.kind == parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
+            return True
+    return False
 
 
 class Story:
@@ -211,16 +225,18 @@ class Story:
         # Create a ctypes callback that wraps the Python function
         @EXTERNAL_FUNCTION_CB
         def _callback(fun_args, userdata):
-            # Read arguments from the fun_args context
-            argc = LIB.bink_fun_args_count(fun_args)
+            # Read arguments from the fun_args context. No-arg externals are common;
+            # skip bink_fun_args_get because this native build reports a bogus count.
             args = []
-            for i in range(argc):
-                arg_val = ctypes.c_void_p()
-                ret = LIB.bink_fun_args_get(
-                    fun_args, i, ctypes.byref(arg_val))
-                if ret == BINK_OK:
-                    args.append(_value_to_python(arg_val))
-                    LIB.bink_value_free(arg_val)
+            if _external_reads_args(fn):
+                argc = LIB.bink_fun_args_count(fun_args)
+                for i in range(argc):
+                    arg_val = ctypes.c_void_p()
+                    ret = LIB.bink_fun_args_get(
+                        fun_args, i, ctypes.byref(arg_val))
+                    if ret == BINK_OK:
+                        args.append(_value_to_python(arg_val))
+                        LIB.bink_value_free(arg_val)
 
             # Call the Python function
             result = fn(*args)
